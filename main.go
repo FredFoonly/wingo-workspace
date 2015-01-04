@@ -1,54 +1,90 @@
 //
-// Connects to wingo ipc using the WINGO_SOCKET or XDG_RUNTIME_DIR
-// variables and writes out a gobar-formatted line containing the
-// current workspace, list of workspaces, and whether each workspace
-// has clients.
+// Connects to wingo notify and writes out the notices as they arrive
 //
-
 package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/cmd"
 	"io"
-	"io/ioutil"
-	"log"
+	//"log"
 	"net"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/BurntSushi/cmd"
 )
 
-var wsfile = flag.String("f", "", "When set, will be the file where the gobar-formatted workspace line is written.")
-var hilight = flag.String("cur-fg", "", "When set, will be the foreground color for the current workspace.")
-var lolight = flag.String("other-fg", "", "When set, will be the foreground color for non-current workspaces.")
+const (
+	battUnknownStat = "unknown"
+	datefmt         = "2006-01-02 03:04PM"
+)
+
+var (
+	hilight = flag.String("cur-fg", "", "When set, will be the foreground color for the current workspace.")
+	lolight = flag.String("other-fg", "", "When set, will be the foreground color for non-current workspaces.")
+)
 
 func main() {
 	flag.Parse()
+
 	// Connect to the Wingo command server.
-	sockpath := socketFilePath()
-	conn, err := net.Dial("unix", sockpath)
+	cmdSockPath := socketFilePath()
+	cmdConn, err := net.Dial("unix", cmdSockPath)
 	if err != nil {
-		log.Fatalf("Could not connect to Wingo IPC: '%s'\n", err)
+		panic(fmt.Sprintf("Could not connect to Wingo IPC: '%s'\n", err))
 	}
-	defer conn.Close()
+	defer cmdConn.Close()
 
-	// Build and format the gobar line
-	ws_lst := strings.Split(sendCmd(conn, "GetWorkspaceList"), "\n")
-	curws := strings.TrimSpace(sendCmd(conn, "GetWorkspace"))
-	disp := buildDisplay(conn, curws, ws_lst)
+	notifChan := make(chan map[string]interface{})
+	defer close(notifChan)
+	go notifierListener(notifChan)
 
-	// And write it out to either stdout or the specified file
-	if len(*wsfile) > 0 {
-		ioutil.WriteFile(*wsfile, []byte(disp), 0666)
-	} else {
-		print(disp)
+	tickerChan := time.NewTicker(time.Minute)
+	defer tickerChan.Stop()
+
+	batt := getBatt()
+	showLine(cmdConn, time.Now(), batt)
+	for {
+		select {
+		case time := <-tickerChan.C:
+			batt = getBatt()
+			showLine(cmdConn, time, batt)
+			break
+		case notif := <-notifChan:
+			evt := notif["EventName"]
+			//fmt.Fprintln(os.Stderr, "Event ", evt, " = ", notif)
+			switch evt {
+			case "ChangedVisibleWorkspace", "ManagedClient", "UnmanagedClient":
+				showLine(cmdConn, time.Now(), batt)
+			}
+		}
 	}
 }
 
-func buildDisplay(conn net.Conn, curws string, ws_lst []string) string {
+func getBatt() string {
+	c := cmd.New("apm", "-m")
+	if err := c.Run(); err != nil {
+		return battUnknownStat
+	}
+	return strings.TrimSpace(c.BufStdout.String())
+}
+
+func showLine(conn net.Conn, now time.Time, batt string) {
+	// Build and format the gobar line
+	ws_lst := strings.Split(sendCmd(conn, "GetWorkspaceList"), "\n")
+	curws := strings.TrimSpace(sendCmd(conn, "GetWorkspace"))
+	disp := buildDisplayLine(conn, curws, ws_lst, now.Format(datefmt), batt)
+	fmt.Fprint(os.Stdout, disp)
+}
+
+func buildDisplayLine(conn net.Conn, curws string, ws_lst []string, stime string, sbatt string) string {
 	ws_str := make([]byte, 0)
+
+	// workspaces
 	for _, ws := range ws_lst {
 		var piece []byte
 		clients := sendCmd(conn, fmt.Sprintf("GetClientList \"%s\"", ws))
@@ -72,8 +108,50 @@ func buildDisplay(conn net.Conn, curws string, ws_lst []string) string {
 		}
 		ws_str = append(ws_str, []byte(piece)...)
 	}
+
+	// time
+	if sbatt == battUnknownStat {
+		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARpwr | %s}", stime))...)
+	} else {
+		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARbatt %sm | %s}", sbatt, stime))...)
+	}
+
 	ws_str = append(ws_str, []byte("\n")...)
 	return string(ws_str)
+}
+
+func notifierListener(notifChan chan map[string]interface{}) {
+	// Connect to the Wingo notification server.
+	notifSockPath := notifySocketFilePath()
+	notifConn, err := net.Dial("unix", notifSockPath)
+	if err != nil {
+		panic(fmt.Sprintf("Could not connect to Wingo notifications: '%s'\n", err))
+	}
+	defer notifConn.Close()
+
+	rdr := bufio.NewReader(notifConn)
+	for {
+		notice, err := rdr.ReadString(0)
+		if err != nil {
+			break
+		}
+		notice = notice[:len(notice)-1] // get rid of trailing null
+		data := []byte(notice)
+
+		jsonMap := make(map[string]interface{})
+		if err = json.Unmarshal(data, &jsonMap); err != nil {
+			fmt.Fprint(os.Stderr, "Error marshalling JSON: ", err)
+			continue
+		}
+		evt, ok := jsonMap["EventName"]
+		if !ok {
+			continue
+		}
+		if evt == "Noop" {
+			continue
+		}
+		notifChan <- jsonMap
+	}
 }
 
 func sendCmd(conn net.Conn, cmds string) string {
@@ -82,14 +160,14 @@ func sendCmd(conn net.Conn, cmds string) string {
 
 	// Send it.
 	if _, err := conn.(io.Writer).Write(cmd); err != nil {
-		log.Fatalf("Error writing command: %s", err)
+		panic(fmt.Sprintf("Error writing command: %s", err))
 	}
 
 	// Read the response.
 	reader := bufio.NewReader(conn.(io.Reader))
 	msg, err := reader.ReadString(0)
 	if err != nil {
-		log.Fatalf("Could not read response: %s", err)
+		panic(fmt.Sprintf("Could not read response: %s", err))
 	}
 	msg = msg[:len(msg)-1] // get rid of null terminator
 
@@ -103,6 +181,23 @@ func socketFilePath() string {
 		return strings.TrimSpace(sockpath)
 	}
 
+	// Ask wingo where it is
+	bGotIt := false
+	var backoff int64 = 1
+	for !bGotIt {
+		c := cmd.New("wingo", "--show-socket")
+		if err := c.Run(); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			time.Sleep(time.Duration(int64(time.Millisecond) * backoff))
+			backoff += 100
+			if backoff > 2000 {
+				break
+			}
+		} else {
+			return strings.TrimSpace(c.BufStdout.String())
+		}
+	}
+
 	// Try to build it from XDG
 	xdg_run := os.Getenv("XDG_RUNTIME_DIR")
 	disp := os.Getenv("DISPLAY")
@@ -110,11 +205,39 @@ func socketFilePath() string {
 		return fmt.Sprintf("%s/wingo/%s.0", xdg_run, disp)
 	}
 
-	// Eff it, just ask wingo where it is
-	c := cmd.New("wingo", "--show-socket")
-	if err := c.Run(); err != nil {
-		log.Fatal(err)
+	return ""
+}
+
+func notifySocketFilePath() string {
+	// Try to read it from env
+	sockpath := os.Getenv("WINGO_NOTIFY_SOCKET")
+	if len(sockpath) > 0 {
+		return strings.TrimSpace(sockpath)
 	}
 
-	return strings.TrimSpace(c.BufStdout.String())
+	// Ask wingo where it is
+	bGotIt := false
+	var backoff int64 = 1
+	for !bGotIt {
+		c := cmd.New("wingo", "--show-notify-socket")
+		if err := c.Run(); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			time.Sleep(time.Duration(int64(time.Millisecond) * backoff))
+			backoff += 100
+			if backoff > 2000 {
+				break
+			}
+		} else {
+			return strings.TrimSpace(c.BufStdout.String())
+		}
+	}
+
+	// Try to build it from XDG
+	xdg_run := os.Getenv("XDG_RUNTIME_DIR")
+	disp := os.Getenv("DISPLAY")
+	if len(xdg_run) > 0 && len(disp) > 0 {
+		return fmt.Sprintf("%s/wingo/%s.0", xdg_run, disp)
+	}
+
+	return ""
 }
