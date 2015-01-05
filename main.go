@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	//"log"
 	"net"
 	"os"
 	"strings"
@@ -19,72 +18,78 @@ import (
 )
 
 const (
+	battNone        = "none"
 	battUnknownStat = "unknown"
 	datefmt         = "2006-01-02 03:04PM"
 )
 
 var (
-	hilight = flag.String("cur-fg", "", "When set, will be the foreground color for the current workspace.")
-	lolight = flag.String("other-fg", "", "When set, will be the foreground color for non-current workspaces.")
+	hilight  = flag.String("cur-fg", "", "When set, will be the foreground color for the current workspace.")
+	lolight  = flag.String("other-fg", "", "When set, will be the foreground color for non-current workspaces.")
+	showbatt = flag.Bool("batt", true, "When set, show the remaining battery charge.")
 )
 
 func main() {
 	flag.Parse()
 
-	// Connect to the Wingo command server.
 	cmdSockPath := socketFilePath()
-	cmdConn, err := net.Dial("unix", cmdSockPath)
-	if err != nil {
-		panic(fmt.Sprintf("Could not connect to Wingo IPC: '%s'\n", err))
-	}
-	defer cmdConn.Close()
 
+	// Listen for relevant changes from wingo
 	notifChan := make(chan map[string]interface{})
 	defer close(notifChan)
 	go notifierListener(notifChan)
 
+	// Listen to the clock
 	tickerChan := time.NewTicker(time.Minute)
 	defer tickerChan.Stop()
 
 	batt := getBatt()
-	showLine(cmdConn, time.Now(), batt)
+	showLine(cmdSockPath, time.Now(), batt)
 	for {
 		select {
 		case time := <-tickerChan.C:
 			batt = getBatt()
-			showLine(cmdConn, time, batt)
+			showLine(cmdSockPath, time, batt)
 			break
 		case notif := <-notifChan:
 			evt := notif["EventName"]
-			//fmt.Fprintln(os.Stderr, "Event ", evt, " = ", notif)
 			switch evt {
 			case "ChangedVisibleWorkspace", "ManagedClient", "UnmanagedClient":
-				showLine(cmdConn, time.Now(), batt)
+				showLine(cmdSockPath, time.Now(), batt)
 			}
 		}
 	}
 }
 
 func getBatt() string {
-	c := cmd.New("apm", "-m")
-	if err := c.Run(); err != nil {
-		return battUnknownStat
+	if *showbatt {
+		c := cmd.New("apm", "-m")
+		if err := c.Run(); err != nil {
+			return battUnknownStat
+		}
+		return strings.TrimSpace(c.BufStdout.String())
 	}
-	return strings.TrimSpace(c.BufStdout.String())
+	return battNone
 }
 
-func showLine(conn net.Conn, now time.Time, batt string) {
-	// Build and format the gobar line
-	ws_lst := strings.Split(sendCmd(conn, "GetWorkspaceList"), "\n")
-	curws := strings.TrimSpace(sendCmd(conn, "GetWorkspace"))
-	disp := buildDisplayLine(conn, curws, ws_lst, now.Format(datefmt), batt)
+func showLine(cmdSockPath string, now time.Time, batt string) {
+	// Connect to the Wingo command server.
+	cmdConn, err := net.Dial("unix", cmdSockPath)
+	if err != nil {
+		return
+	}
+	defer cmdConn.Close()
+
+	ws_lst := strings.Split(sendCmd(cmdConn, "GetWorkspaceList"), "\n")
+	curws := strings.TrimSpace(sendCmd(cmdConn, "GetWorkspace"))
+	disp := buildDisplayLine(cmdConn, curws, ws_lst, now.Format(datefmt), batt)
 	fmt.Fprint(os.Stdout, disp)
 }
 
 func buildDisplayLine(conn net.Conn, curws string, ws_lst []string, stime string, sbatt string) string {
 	ws_str := make([]byte, 0)
 
-	// workspaces
+	// Format in workspace list
 	for _, ws := range ws_lst {
 		var piece []byte
 		clients := sendCmd(conn, fmt.Sprintf("GetClientList \"%s\"", ws))
@@ -98,44 +103,57 @@ func buildDisplayLine(conn net.Conn, curws string, ws_lst []string, stime string
 			if len(*hilight) > 0 {
 				hilight_ctrl = "CF0x" + *hilight
 			}
-			piece = []byte(fmt.Sprintf("{%s[%s]}  ", hilight_ctrl, ws))
+			piece = []byte(fmt.Sprintf("{%s[%s%s]}  ", hilight_ctrl, clmark, ws))
 		} else {
 			lolight_ctrl := ""
 			if len(*lolight) > 0 {
 				lolight_ctrl = "CF0x" + *lolight
 			}
-			piece = []byte(fmt.Sprintf("%s{%s%s}  ", clmark, lolight_ctrl, ws))
+			piece = []byte(fmt.Sprintf("{%s%s%s}  ", lolight_ctrl, clmark, ws))
 		}
 		ws_str = append(ws_str, []byte(piece)...)
 	}
 
-	// time
-	if sbatt == battUnknownStat {
-		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARpwr | %s}", stime))...)
-	} else {
-		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARbatt %sm | %s}", sbatt, stime))...)
+	// Format in batt & time
+	switch sbatt {
+	case battNone:
+		ws_str = append(ws_str, []byte(fmt.Sprintf("{AR%s}", stime))...)
+	case battUnknownStat:
+		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARwall | %s}", stime))...)
+	default:
+		ws_str = append(ws_str, []byte(fmt.Sprintf("{AR%sm | %s}", sbatt, stime))...)
 	}
 
 	ws_str = append(ws_str, []byte("\n")...)
 	return string(ws_str)
 }
 
+func getNotifListener(notifSockPath string) (net.Conn, *bufio.Reader) {
+	for {
+		notifConn, err := net.Dial("unix", notifSockPath)
+		if err == nil {
+			return notifConn, bufio.NewReader(notifConn)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 func notifierListener(notifChan chan map[string]interface{}) {
 	// Connect to the Wingo notification server.
 	notifSockPath := notifySocketFilePath()
-	notifConn, err := net.Dial("unix", notifSockPath)
-	if err != nil {
-		panic(fmt.Sprintf("Could not connect to Wingo notifications: '%s'\n", err))
-	}
+	notifConn, rdr := getNotifListener(notifSockPath)
 	defer notifConn.Close()
 
-	rdr := bufio.NewReader(notifConn)
+	// Listen for interesting notices
 	for {
 		notice, err := rdr.ReadString(0)
 		if err != nil {
-			break
+			time.Sleep(time.Second)
+			notifConn, rdr = getNotifListener(notifSockPath)
+			defer notifConn.Close()
+			continue
 		}
-		notice = notice[:len(notice)-1] // get rid of trailing null
+		notice = notice[:len(notice)-1] // Get rid of trailing null
 		data := []byte(notice)
 
 		jsonMap := make(map[string]interface{})
