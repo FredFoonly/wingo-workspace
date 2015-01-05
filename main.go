@@ -64,11 +64,6 @@ func main() {
 
 func getBatt() string {
 	if *showbatt {
-		//c := cmd.New("apm", "-m")
-		//if err := c.Run(); err != nil {
-		//	return battUnknownStat
-		//}
-		//return strings.TrimSpace(c.BufStdout.String())
 		return apm.GetBattMins()
 	}
 	return ""
