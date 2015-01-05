@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/cmd"
+	"github.com/FredFoonly/wingo-workspace/apm"
 )
 
 const (
@@ -63,13 +64,14 @@ func main() {
 
 func getBatt() string {
 	if *showbatt {
-		c := cmd.New("apm", "-m")
-		if err := c.Run(); err != nil {
-			return battUnknownStat
-		}
-		return strings.TrimSpace(c.BufStdout.String())
+		//c := cmd.New("apm", "-m")
+		//if err := c.Run(); err != nil {
+		//	return battUnknownStat
+		//}
+		//return strings.TrimSpace(c.BufStdout.String())
+		return apm.GetBattMins()
 	}
-	return battNone
+	return ""
 }
 
 func showLine(cmdSockPath string, now time.Time, batt string) {
