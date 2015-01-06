@@ -25,6 +25,8 @@ package apm
 //
 import "C"
 
+import "fmt"
+
 func GetBattMins() string {
 	apmstat, err := GetapmStats()
 	if err != nil {
@@ -33,7 +35,7 @@ func GetBattMins() string {
 	if apmstat.Minutes_left < 0 {
 		return "unknown"
 	}
-	return string(apmstat.Minutes_left)
+	return fmt.Sprintf("%d", apmstat.Minutes_left)
 }
 
 func GetapmStats() (Apminfo, error) {
