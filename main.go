@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,9 +20,9 @@ import (
 )
 
 const (
-	battNone        = "none"
-	battUnknownStat = "unknown"
-	datefmt         = "2006-01-02 03:04PM"
+	battNone = "none"
+	battWall = "wall"
+	datefmt  = "2006-01-02 03:04PM"
 )
 
 var (
@@ -44,12 +45,12 @@ func main() {
 	tickerChan := time.NewTicker(time.Minute)
 	defer tickerChan.Stop()
 
-	batt := getBatt()
+	batt := getBattStr()
 	showLine(cmdSockPath, time.Now(), batt)
 	for {
 		select {
 		case time := <-tickerChan.C:
-			batt = getBatt()
+			batt = getBattStr()
 			showLine(cmdSockPath, time, batt)
 			break
 		case notif := <-notifChan:
@@ -62,9 +63,16 @@ func main() {
 	}
 }
 
-func getBatt() string {
+func getBattStr() string {
 	if *showbatt {
-		return apm.GetBattMins()
+		state, mins, err := apm.GetBattMins()
+		if err != nil {
+			return ""
+		}
+		if state == apm.APM_Source_Wall {
+			return "wall"
+		}
+		return strconv.Itoa(mins)
 	}
 	return ""
 }
@@ -86,7 +94,7 @@ func showLine(cmdSockPath string, now time.Time, batt string) {
 func buildDisplayLine(conn net.Conn, curws string, ws_lst []string, stime string, sbatt string) string {
 	ws_str := make([]byte, 0)
 
-	// Format in workspace list
+	// Format up the workspace list
 	for _, ws := range ws_lst {
 		var piece []byte
 		clients := sendCmd(conn, fmt.Sprintf("GetClientList \"%s\"", ws))
@@ -111,11 +119,11 @@ func buildDisplayLine(conn net.Conn, curws string, ws_lst []string, stime string
 		ws_str = append(ws_str, []byte(piece)...)
 	}
 
-	// Format in batt & time
+	// Format up batt & time
 	switch sbatt {
 	case battNone:
 		ws_str = append(ws_str, []byte(fmt.Sprintf("{AR%s}", stime))...)
-	case battUnknownStat:
+	case battWall:
 		ws_str = append(ws_str, []byte(fmt.Sprintf("{ARwall | %s}", stime))...)
 	default:
 		ws_str = append(ws_str, []byte(fmt.Sprintf("{AR%sm | %s}", sbatt, stime))...)
