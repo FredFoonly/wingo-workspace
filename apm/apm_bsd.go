@@ -14,6 +14,8 @@ package apm
 //   close(fd);
 //   return rc;
 // }
+// struct apm_power_info* alloc_apm_power_info() { return malloc(sizeof(struct apm_power_info)); }
+// void free_apm_power_info(struct apm_power_info* pwr) { free(pwr); }
 import "C"
 
 //import "fmt"
@@ -50,7 +52,8 @@ func GetBattMins() (APM_Power_Source, int, error) {
 }
 
 func Getapminfo() (Apminfo, error) {
-	apmpwr := new(C.struct_apm_power_info)
+	var apmpwr *C.struct_apm_power_info = C.alloc_apm_power_info()
+	defer C.free_apm_power_info(apmpwr)
 	rc := C.wrapper_getbattstat(apmpwr)
 	if rc == 0 {
 		apmstat := Apminfo{
